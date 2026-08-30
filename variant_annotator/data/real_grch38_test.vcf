@@ -1,0 +1,11 @@
+##fileformat=VCFv4.2
+##reference=GRCh38
+##source=Validated_GRCh38_test_variants
+##INFO=<ID=GENE,Number=1,Type=String,Description="Gene symbol">
+##INFO=<ID=RS,Number=1,Type=String,Description="dbSNP identifier">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE1	SAMPLE2
+chr19	44908684	rs429358	T	C	.	PASS	GENE=APOE;RS=rs429358	GT:DP:AD	0/1:31:27,4	0/0:29:29,0
+chr19	44908822	rs7412	C	T	.	PASS	GENE=APOE;RS=rs7412	GT:DP:AD	0/1:40:32,8	0/0:38:38,0
