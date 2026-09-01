@@ -1,126 +1,166 @@
-import requests
 import time
+from typing import Any, Dict, List
+import requests
 from custom_vcf_parser import parse_vcf, split_multiallelic
 
-
-################################
-# Step 1: The Automated Blueprint (Using Ensembl VEP)
-################################
 SERVER = "https://rest.ensembl.org"
 HEADERS = {
     "Content-Type": "application/json",
-    "Accept": "application/json"
+    "Accept": "application/json",
 }
 
-def determine_variant_impact(chrom: str, pos: int, ref: str, alt: str, retries: int = 2) -> str:
+
+def build_vep_region_string(
+    chrom: str, pos: int, ref: str, alt: str
+) -> tuple[str, str]:
+    """Translates VCF variants into Ensembl VEP REST region format.
+
+    Handles anchor base trimming for insertions and deletions.
     """
-    Queries the Ensembl VEP REST API to retrieve the exact biological impact
-    of a genomic variant on human transcripts (GRCh38).
-    """
-    # Clean chromosome names for Ensembl formatting rules
     chrom_clean = chrom.replace("chr", "")
 
-    # VCF encodes indels with a shared "anchor" base at the start of REF/ALT
-    # (e.g. REF=ATCT, ALT=A means "delete TCT, keep the leading A").
-    # VEP's region-based GET endpoint wants just the deleted/inserted bases
-    # and a position that excludes that anchor -- passing the raw VCF-style
-    # REF/ALT straight through gives coordinates that don't reliably line
-    # up with the actual variant, which is why deletions were flip-flopping
-    # between categories across identical reruns.
     if len(ref) > 1 and len(alt) == 1 and ref[0] == alt[0]:
-        # Deletion: drop the anchor base from REF, query starts one base later.
+        # Deletion
         deleted = ref[1:]
         start = pos + 1
         end = pos + len(deleted)
         vep_allele = "-"
     elif len(alt) > 1 and len(ref) == 1 and alt[0] == ref[0]:
-        # Insertion: VEP wants start > end for pure insertions, allele = inserted bases.
+        # Insertion
         inserted = alt[1:]
         start = pos + 1
         end = pos
         vep_allele = inserted
     else:
-        # SNV or complex substitution -- no anchor base to strip.
+        # SNV / Substitution
         start = pos
         end = pos + len(ref) - 1
         vep_allele = alt
 
-    # Build VEP REST API notation path string
-    ext = f"/vep/homo_sapiens/region/{chrom_clean}:{start}-{end}/{vep_allele}?"
+    region_str = f"{chrom_clean}:{start}-{end}/{vep_allele}"
+    lookup_key = f"{chrom}:{pos}_{ref}/{alt}"
 
-    try:
-        response = None
-        for attempt in range(retries + 1):  # try up to retries+1 times total
-            response = requests.get(SERVER + ext, headers=HEADERS)
+    return region_str, lookup_key
+
+
+def parse_vep_consequence(vep_entry: Dict[str, Any]) -> str:
+    """Parses raw VEP JSON output into a single high-level impact category."""
+    consequences = vep_entry.get("transcript_consequences", [])
+    if not consequences:
+        return "Intergenic/Intronic"
+
+    impact_terms = set()
+    for csq in consequences:
+        for term in csq.get("consequence_terms", []):
+            impact_terms.add(term)
+
+    # Priority ranking of consequence terms
+    if "frameshift_variant" in impact_terms:
+        return "Frameshift/Indel"
+    elif "stop_gained" in impact_terms:
+        return "Nonsense"
+    elif "missense_variant" in impact_terms:
+        return "Missense"
+    elif "synonymous_variant" in impact_terms:
+        return "Synonymous"
+
+    return list(impact_terms)[0] if impact_terms else "Unknown"
+
+
+def determine_variant_impact(
+    chrom: str, pos: int, ref: str, alt: str, retries: int = 2
+) -> str:
+    """Queries single variant against Ensembl VEP REST GET endpoint."""
+    region_str, _ = build_vep_region_string(chrom, pos, ref, alt)
+    ext = f"/vep/homo_sapiens/region/{region_str}?"
+
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(
+                SERVER + ext, headers=HEADERS, timeout=10
+            )
             if response.ok:
-                break
+                vep_data = response.json()
+                return (
+                    parse_vep_consequence(vep_data[0])
+                    if vep_data
+                    else "No_Transcript_Overlap"
+                )
             if response.status_code >= 500 and attempt < retries:
-                time.sleep(1 + attempt)   # wait 1s, then 2s, before retrying
+                time.sleep(1 + attempt)
                 continue
-            break   # not a retryable 5xx, or out of retries -- stop trying
-
-        if not response.ok:
-            # TEMPORARY DEBUG: print the response body so we can see exactly
-            # why VEP is rejecting the request on a 400 (client-side error).
-            # Remove this print once the 400s are understood/fixed.
-            if response.status_code == 400:
-                print(f"[debug] 400 body for {chrom}:{pos} {ref}>{alt} "
-                      f"(queried as {chrom_clean}:{start}-{end}/{vep_allele}): "
-                      f"{response.text[:300]}")
             return f"API_Error_{response.status_code}"
+        except requests.exceptions.RequestException as e:
+            if attempt == retries:
+                return f"Connection_Error: {e}"
+            time.sleep(1)
 
-        vep_data = response.json()
-        if not vep_data:
-            return "No_Transcript_Overlap"
-
-        # Inspect consequences predicted for the variant entry
-        consequences = vep_data[0].get("transcript_consequences", [])
-        if not consequences:
-            return "Intergenic/Intronic"
-
-        # Pick the highest-impact consequence terms across transcripts
-        # Ensembl Sequence Ontology (SO) terms mapping to your target categories:
-        impact_terms = set()
-        for csq in consequences:
-            for term in csq.get("consequence_terms", []):
-                impact_terms.add(term)
-
-        # Classify the primary functional impact profile
-        if "frameshift_variant" in impact_terms:
-            return "Frameshift/Indel"
-        elif "stop_gained" in impact_terms:
-            return "Nonsense"
-        elif "missense_variant" in impact_terms:
-            return "Missense"
-        elif "synonymous_variant" in impact_terms:
-            return "Synonymous"
-
-        # Return fallback if it's a different coding/splicing consequence type
-        return list(impact_terms)[0] if impact_terms else "Unknown"
-
-    except Exception as e:
-        print(f"[warning] {chrom}:{pos} failed: {e}")
-        return "Connection_Error"
+    return "Unknown_Failure"
 
 
-###########################
-# Step 2: Integration Loop
-###########################
+def determine_batch_variant_impacts(variants: List[Any]) -> Dict[str, str]:
+    """Queries a batch of variants in a SINGLE POST request to Ensembl VEP.
 
-# Assuming you already loaded your file using: raw_variants = parse_vcf("input.vcf")
-raw_variants = parse_vcf("variant_annotator/data/real_grch38_test.vcf")
+    Significantly reduces network overhead for larger VCFs.
+    """
+    post_hgvs_list = []
+    key_mapping = {}
 
-print(f"{'VARIANT':<20} | {'TYPE':<12} | {'FUNCTIONAL IMPACT'}")
-print("-" * 55)
+    for v in variants:
+        region_str, lookup_key = build_vep_region_string(
+            v.chrom, v.pos, v.ref, v.alt
+        )
+        post_hgvs_list.append(region_str)
+        key_mapping[region_str] = lookup_key
 
-for raw_v in raw_variants:
-    for v in split_multiallelic(raw_v):
+    ext = "/vep/homo_sapiens/region"
+    payload = {"variants": post_hgvs_list}
 
-        # Call the automated evaluation function
-        functional_impact = determine_variant_impact(v.chrom, v.pos, v.ref, v.alt)
+    results = {}
+    try:
+        response = requests.post(
+            SERVER + ext, headers=HEADERS, json=payload, timeout=15
+        )
+        if response.ok:
+            for item in response.json():
+                input_str = item.get("input")
+                lookup_key = key_mapping.get(input_str)
+                if lookup_key:
+                    results[lookup_key] = parse_vep_consequence(item)
+        else:
+            print(f"[warning] Batch VEP call failed: HTTP {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"[warning] Batch VEP connection error: {e}")
+
+    return results
+
+
+def main():
+    vcf_path = "variant_annotator/data/real_grch38_test.vcf"
+    raw_variants = parse_vcf(vcf_path)
+
+    # Flatten multiallelic sites into distinct variant instances
+    split_variants = [
+        v for raw_v in raw_variants for v in split_multiallelic(raw_v)
+    ]
+
+    print(f"{'VARIANT':<20} | {'TYPE':<12} | {'FUNCTIONAL IMPACT'}")
+    print("-" * 55)
+
+    # Option A: Fast Batch POST API query
+    batch_impacts = determine_batch_variant_impacts(split_variants)
+
+    for v in split_variants:
+        lookup_key = f"{v.chrom}:{v.pos}_{v.ref}/{v.alt}"
+        impact = batch_impacts.get(lookup_key)
+
+        # Fallback to single GET if batch returned no data for this variant
+        if not impact:
+            impact = determine_variant_impact(v.chrom, v.pos, v.ref, v.alt)
 
         variant_str = f"{v.chrom}:{v.pos} {v.ref}>{v.alt}"
-        print(f"{variant_str:<20} | {v.variant_type:<12} | {functional_impact}")
+        print(f"{variant_str:<20} | {v.variant_type:<12} | {impact}")
 
-        # Protect against Ensembl endpoint rate throttling (Limit < 15 req/sec)
-        time.sleep(0.1)
+
+if __name__ == "__main__":
+    main()
